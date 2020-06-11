@@ -1,0 +1,357 @@
+---
+title: "Apprentissage Statistique"
+subtitle: "Data Pre Processing - New York city Airbnb"
+subsubtitle: "RStudio version 1.2.5001 & R version 3.6.2 (2019-12-12)"
+author: "Julien Le Mauff"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    keep_md: yes
+    number_sections: true
+  pdf_document: 
+    keep_tex: yes
+    number_sections: true
+fontsize: 12pt
+always_allow_html: true
+header-includes:
+- \usepackage{amsmath}
+- \newcommand{\E}{\operatorname{E}}
+- \newcommand{\Var}{\operatorname{Var}}
+- \newcommand{\ind}{\mathbb{I}}
+- \newcommand{\tr}{\operatorname{tr}}
+- \newcommand{\R}{\mathbb{R}}
+- \newcommand{\cvd}{\mbox{$\stackrel{d}{\longrightarrow}\,$}}
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+opts_chunk$set(warning = FALSE, message = FALSE, 
+               autodep = TRUE, cache = TRUE, eval = FALSE,
+               fig.dim=c(8,3.5))
+
+
+options(tinytex.verbose = TRUE)
+```
+
+```{r Libraries, include=FALSE}
+library(dplyr)
+library(tidyr)
+library(psych)
+library(caret)
+library(ggplot2)
+library(ggmap)
+library(lubridate)
+library(stringr)
+library(forcats)
+library(foreach)
+library(gridExtra)
+library(readr)
+library(xgboost)
+library(e1071)
+library(kernlab)
+library(corrplot)
+library(doMC)
+library(GGally)
+```
+
+The aim of this document is to present an overview of the basis concepts of the data pre-processing. We mean by the term pre-processing the step of a Machine Learning project in which data gets transformed so that the machine can easily analyze it, especially when performing algorithms. Indeed raw data face a large number of issues which the best known are missing data, inconsistent and dupplicated values, outliers, categorical variable and feature scaling. All these points must be taken into account in order to carry out a project, and this first task is a major step in a ML project. Sophisticated algorithms will not compensate for bad data.
+
+So without wasting time, let's take a closer look at the different steps of the data Pre Processing!
+
+## Step 1: Data formatting
+
+Before going into the details of data cleaning, you have make sure that your data are in the right format, which means managing with these different tasks:
+
+#### Variable selection 
+
+A lot of dataset are available online in csv formats. The following work is based on the open data from *[inside Airbnb] (http://insideairbnb.com/get-the-data.html)*. Our objective will be to set up a model allowing to forecast the price of the housing available on the platform. In this setting we will focus on the housing available in New York city. 
+
+```{r import raw data}
+# Import the downloaned data
+files <- read.csv("/Users/lemauffjulien/Documents/Documents/Master 2/Mémoire/Data/listing.csv", sep = ",")
+```
+
+Since the original dataset includes a large number of variables that are not relevant to our project, we have to do a first sort and keep only the relevant ones, that is to say all the variables whose value can have an impact on the housing price. This selection task can be realized using empirical results, litterature review, etc. 
+In our example, the predictors we need are those that give informations about the housing (location, attributes, rating), the host attributes and the rental rules.
+
+```{r select predictors}
+# Select the columns we want to keep from the initial listings csv files
+listings_keep <- c("id", "price", "host_is_superhost",
+                   "neighbourhood_group_cleansed", "neighbourhood_cleansed",
+                   "latitude","longitude", "property_type", "accommodates",
+                   "bedrooms", "beds", "bed_type", "cleaning_fee",
+                   "minimum_nights", "availability_365",
+                   "review_scores_rating","cancellation_policy")
+
+listings <-  files %>% select(listings_keep)
+```
+
+
+### Dealing with inconsistent values
+
+As we saw before, some values are meaningless and must be treated in order to get an operational database. First of all, we need to focus on the id of the housing. Indeed when we deal with large database, we often face dupplicated values that we have to drop.  
+
+```{r 1st inconsistent values}
+# Eliminate all duplicates listings
+listings <- listings[!duplicated(listings$id),]
+
+# Eliminate observations with missing id
+listings <- listings[complete.cases(listings$id),]
+```
+
+Then another common thing to do is to look at the class of each variables, focusing particularly on the numerical ones, and also at the summary of your data. This work will help you to have a first look on your data, and see the points that you might find surprising.   
+
+```{r check data structure}
+# Check the class of each variables 
+lapply(listings,class)
+
+# Check the statistical summary of each variables
+summary(listings)
+```
+
+We can thus see that:
+
+- *price* and *cleaning_fee* are stored as factor innstead of numeric
+- catagorical variables are stored as factor
+- there is observations where price is equal to 0
+- *host_is_superhost* presents 11 empty boxes 
+
+```{r 2nd inconsistent values}
+# Eliminate the $ sign on price
+listings$price = as.numeric(gsub("[\\$,]", "", listings$price))
+
+# Eliminate the $ sign on cleaning fee
+listings$cleaning_fee = as.numeric(gsub("[\\$,]", "", listings$cleaning_fee))
+
+# For the sake of simplicity, we delete the observations where price is null
+listings <- listings %>% filter(price > 0) 
+
+# Replace the empty cases by NA's
+listings$host_is_superhost[listings$host_is_superhost==""] <- NA
+```
+
+Once we have complete this first step, we can export the database in our repository. This step is not obligatory, but it allows to keep track of our data before cleaning it.
+
+```{r export new data}
+# Export the listing compiled database
+write.csv(listings, "Data/data_compiled.csv", row.names = FALSE)
+```
+
+### Step 2: Data cleaning
+
+We import our new database: 
+
+```{r import new data}
+mydata <- read.csv("/Users/lemauffjulien/Documents/Documents/Master 2/Mémoire/Data/data_compiled.csv", sep = "," )
+```
+
+> **Warning** : 
+
+> As we saw before, categorical variables are stored as factor, although they should be
+> considered as character.  This is due to the fact that storing categorical data as factor
+> may save a lot of memory. The `str()` function allows you to see the output for the
+> different variables:  
+
+```{r see data output}
+str(mydata)
+```
+
+The default behavior of R when creating data blocks is to convert all characters to factors. This can cause a headache for novice R users trying to figure out why the character columns are not working properly. To turn off this behavior we will therefore use the option `stringsAsFactors = FALSE` when importing the database :
+
+```{r factor into character}
+mydata <- read.csv("/Users/lemauffjulien/Documents/Documents/Master 2/Mémoire/Data/data_compiled.csv", sep = ",", stringsAsFactors = FALSE )
+```
+
+#### Dealing with missing values
+
+Most of the time, you will see that your database include missing data, and dealing with this issue is mandatory in all data pre processing situation. In the following, you will see some basic methods that allow to deal with this issue.
+
+The code below allows you to see the number of NA for each variable. 
+
+```{r count NA}
+# NA count 
+na_count <- as.data.frame(colSums(mydata%>%is.na(.)))
+na_count
+```
+
+```{r NA correction}
+#  === Bedrooms === 
+
+histogram(mydata$bedrooms)
+
+# Given the distribution, we could replace the 112 missing values
+# of bedrooms (the number of bedrooms) by the median grouped by
+# property type, number of accomodates and bed types.
+
+# We would use the median because we want an integer and not a float
+# (numbers with commas). Furthermore, the median works great against 
+# skewed distribution and outliers. 
+
+mydata <- mydata %>%
+  group_by(
+    property_type,
+    accommodates,
+    bed_type) %>%
+  mutate(bedrooms=ifelse(is.na(bedrooms),
+                         median(bedrooms,na.rm = T),bedrooms)) %>%
+  ungroup()
+
+#  === Beds === 
+
+histogram(mydata$beds)
+
+# Given the distribution, we could replace the 174 missing values
+# of beds (the number of beds) by the median grouped
+# by property type, number of accomodates and bed types
+
+# One more time we would use the median because we want an integer 
+
+mydata <- mydata %>%
+  group_by(
+    property_type,
+    accommodates,
+    bed_type) %>%
+  mutate(beds=ifelse(is.na(beds),
+                         median(beds,na.rm=T),beds)) %>%
+  ungroup()
+
+# There is still 2 missing values so we could just replace them with the
+# overall median 
+
+mydata[is.na(mydata$beds), "beds"] <-
+  median(mydata$beds, na.rm = T)
+
+# === Cleaning fee ===
+
+# A cleaning fee is a one-time fee charged by hosts to cover the cost of
+# cleaning their rental when guests depart. Not all hosts charge this fee. 
+# Some incorporate it into their nightly rate.
+
+# Therefore it is safe to assume that when there is no value for this
+# variable it simply means that the host didn't charge
+
+mydata[is.na(mydata$cleaning_fee), "cleaning_fee"] <- 0
+
+# === Host is superhost ===
+
+# There is only 11 missing values out of more than 500000
+# Therefore we will just replace them by the most common value (f)
+
+mydata[is.na(mydata$host_is_superhost),"host_is_superhost"] <- "f"
+
+# === Review scores rating ===
+
+histogram(mydata$review_scores_rating)
+
+# Given that the distribution is skewed on the right, we will use the
+# median to approximate the missing values grouped by neighbours,
+# property types, type of beds and if the host is a superhost.
+
+mydata <- mydata %>%
+  group_by(neighbourhood_cleansed,
+           bed_type,
+           property_type,
+           host_is_superhost) %>%
+  mutate(review_scores_rating=ifelse(is.na(review_scores_rating), 
+                                     median(review_scores_rating,na.rm=T),
+                                     review_scores_rating)) %>%
+  ungroup()
+
+# There is still 214 missing values so we could just replace them with the
+# overall score median 
+
+mydata[is.na(mydata$review_scores_rating), "review_scores_rating"] <-
+  median(mydata$review_scores_rating, na.rm = T)
+```
+
+As you can see, we are trying to avoid simply eliminating rows with missing data. With large number of observations and a small proportions of missing data, remove them will not have a large impact on your results. However by doing so with a bigger proportion of NA's, you may removing some crucial informations. That's why you should prefer the alternatives showed here.
+
+#### Dealing with categorical variables 
+
+Here are the four variables that we want to reorganize by creating new subgroups:
+
+```{r categorical variables}
+summary(as.factor(mydata$property_type))
+summary(as.factor(mydata$cancellation_policy))
+summary(as.factor(mydata$bed_type))
+```
+
+
+```{r creating subgroup}
+# # ===== ===== Property type ===== =====
+
+# We groups all 40 subgroups of logement types into 5 big groups
+
+Appartment <- c("Aparthotel","Serviced apartment", "Loft",
+                "Condominium", "Apartment")
+
+House <- c("Barn", "Timeshare", "Dome house", "Lighthouse", "Houseboat",
+           "Treehouse", "Earth house", "Cottage", "Tiny house",
+           "Townhouse", "House", "Bungalow", "Cabin","Villa")
+
+Shared_room <- c("Dorm", "Hostel", "Guesthouse", "Timeshare")
+
+Private_room <- c("Farm stay", "Bed and breakfast", "Resort", "Hotel",
+                  "Boutique hotel", "Guest suite", "In-law")
+
+Other <- c("Train", "Bus", "Boat", "Other", "Cave", "Island",
+           "Camper/RV", "Yurt", "Castle", "Tent", "Casa particular (Cuba)")
+
+mydata <-
+  mutate(mydata,
+         property_type = ifelse(property_type %in% Appartment,
+                                "Appartment", property_type),
+         property_type = ifelse(property_type %in% House,
+                                "House", property_type),
+         property_type = ifelse(property_type %in% Shared_room,
+                                "SharedRoom", property_type),
+         property_type = ifelse(property_type %in% Private_room,
+                                "PrivateRoom", property_type),
+         property_type = ifelse(property_type %in% Other,
+                                "Others", property_type),
+          stringsAsFactors = FALSE)
+
+# Then we remove the observation associated to the property type "Other" since   
+# it brings together a set of marginal housing category
+
+mydata <- mydata[!mydata$property_type=="Others",]
+
+# # ===== ===== Cancellation policy ===== =====
+
+# We groups all 4 subgroups of strict types into only group
+
+mydata <- mutate(mydata, 
+               cancellation_policy = 
+                 ifelse(cancellation_policy=="strict_14_with_grace_period",
+                        "strict", cancellation_policy),
+               cancellation_policy =
+                 ifelse(cancellation_policy=="super_strict_30", 
+                        "strict", cancellation_policy),
+               cancellation_policy =
+                 ifelse(cancellation_policy=="super_strict_60", 
+                        "strict", cancellation_policy))
+
+# # ===== ===== Bed Types ===== =====
+
+# # Since only a handfull of 699 observations out of more than 50000 housing
+# # have their bedtype value which is different from "Real Bed", we can either spread these
+# marginal observations into a subgroup "others" or remove this variable (which is finally
+# meaningless).
+# In this example we decided to remove bed_type
+
+mydata <- mydata[,-which(names(mydata) == "bed_type")]
+
+# # ===== ===== Host Status ===== =====
+
+# For the reading we can change the "t" to "True" and "f" to "False"
+mydata <- mutate(mydata, 
+               host_is_superhost = ifelse(host_is_superhost=="t", 
+                                          "True", "False"))
+```
+
+We finally export our cleaned database for the future development of the ML project.
+
+```{r export cleaned data}
+mydata <- mydata[,-which(names(mydata) == "stringsAsFactors")]
+write.csv(mydata, "Data/clean_data.csv", row.names = FALSE) 
+```
